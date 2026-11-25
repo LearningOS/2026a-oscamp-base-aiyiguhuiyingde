@@ -30,6 +30,11 @@ use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+static CLAIMS: AtomicU32 = AtomicU32::new(0);
+static FASTC: AtomicU32 = AtomicU32::new(0);
+static ELSEC: AtomicU32 = AtomicU32::new(0);
+static ZEROC: AtomicU32 = AtomicU32::new(0);
+
 /// Maximum number of concurrent readers (fits in state bits).
 const READER_MASK: u32 = (1 << 30) - 1;
 /// Bit set when a writer holds the lock.
@@ -45,6 +50,22 @@ pub struct RwLock<T> {
 
 unsafe impl<T: Send> Send for RwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+// Bounded spin backoff: after this many failed attempts we emit an extra round
+// of `spin_loop()` hints. It is deliberately *not* `std::thread::yield_now()`:
+// yielding can hand the CPU to a thread that will never run again (e.g. one
+// whose guard was leaked), which would wedge a kernel-style spin lock.
+const BACKOFF_MAX: u32 = 64;
+
+/// Returns the number of `spin_loop()` hints to emit for iteration `n`.
+#[inline]
+fn backoff_spins(n: u32) -> u32 {
+    if n < 8 {
+        1
+    } else {
+        n.min(BACKOFF_MAX)
+    }
+}
 
 impl<T> RwLock<T> {
     pub const fn new(data: T) -> Self {
@@ -62,8 +83,46 @@ impl<T> RwLock<T> {
     /// 3. If reader count (state & READER_MASK) is already READER_MASK, spin and continue.
     /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        // TODO
-        todo!()
+        let mut spins: u32 = 0;
+        loop {
+            // Acquire: if we end up succeeding, this load is part of the edge
+            // that publishes the previous writer's data to us.
+            let s = self.state.load(Ordering::Acquire);
+
+            // Writer-priority policy: while a writer holds *or merely waits*, no
+            // new reader is admitted. That is what prevents writer starvation --
+            // an endless stream of readers cannot keep a waiting writer out.
+            if spins > 2_000_000 { eprintln!("R-STUCK s={:#010x}", s); spins = 0; }
+            if s & (WRITER_HOLDING | WRITER_WAITING) != 0 {
+                for _ in 0..backoff_spins(spins) {
+                    core::hint::spin_loop();
+                }
+                spins += 1;
+                continue;
+            }
+
+            // Guard against overflowing into the writer bit: refuse to add one
+            // more reader once the counter field is saturated.
+            if (s & READER_MASK) == READER_MASK {
+                for _ in 0..backoff_spins(spins) {
+                    core::hint::spin_loop();
+                }
+                spins += 1;
+                continue;
+            }
+
+            // Strong CAS: a spurious failure here would just cost a retry, but
+            // `false` success would be a correctness bug, so don't risk it.
+            // Adding 1 only touches the low reader-count bits.
+            if self
+                .state
+                .compare_exchange(s, s + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return RwLockReadGuard { lock: self };
+            }
+            spins = 0;
+        }
     }
 
     /// Acquire the write lock. Blocks until no readers and no other writer.
@@ -74,8 +133,82 @@ impl<T> RwLock<T> {
     /// 3. Try compare_exchange(WRITER_WAITING, WRITER_HOLDING, ...) to take the lock; or compare_exchange(0, WRITER_HOLDING, ...) if a writer just released.
     /// 4. On success return RwLockWriteGuard { lock: self }.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        // TODO
-        todo!()
+        // Announce arrival before contending for ownership. From this instant on
+        // readers see WRITER_WAITING and stop queueing up behind themselves, so
+        // the reader stream cannot starve us. fetch_or keeps a bit another writer
+        // already set, so the flag stays up as long as anyone is still waiting.
+        //
+        // The success ordering must be ACQUIRE, not just Release: this is also
+        // where we learn about the previous critical sections. A pure Release
+        // fetch_or would let our first state load run without any happens-before
+        // edge to the last releaser's fetch_and/fetch_sub, so we could read a
+        // stale WRITER_HOLDING bit, believe the lock is free, and enter while a
+        // writer or reader is still inside. AcqRel orders every handoff through
+        // this single location, which is what makes the CAS below a correct
+        // mutual-exclusion claim.
+        self.state.fetch_or(WRITER_WAITING, Ordering::AcqRel);
+
+        let mut spins: u32 = 0;
+        loop {
+            // Acquire on every retry too: a relaxed load could keep returning a
+            // stale value long after the owner cleared its bits.
+            let s = self.state.load(Ordering::Acquire);
+            if spins > 5_000_000 {
+                eprintln!("WLOOP t={:?} s={:#010x} claims={} fast={} else={} spin0={}",
+                    std::thread::current().id(), s,
+                    CLAIMS.swap(0, Ordering::Relaxed), FASTC.swap(0, Ordering::Relaxed),
+                    ELSEC.swap(0, Ordering::Relaxed), ZEROC.swap(0, Ordering::Relaxed));
+                spins = 0;
+            }
+
+            // Fast path: nobody holds the lock and no other writer has claimed
+            // the waiting slot, so install ourselves atomically. Clearing
+            // WRITER_WAITING here is exactly what lets readers pile back in.
+            if s == WRITER_WAITING {
+                if self
+                    .state
+                    .compare_exchange(
+                        WRITER_WAITING,
+                        WRITER_HOLDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    if CLAIMS.fetch_add(1, Ordering::Relaxed) < 12 { eprintln!("W-CASFAIL fast"); }
+                } else {
+                    return RwLockWriteGuard { lock: self };
+                }
+            } else if s & (WRITER_HOLDING | WRITER_WAITING) == WRITER_WAITING
+                && (s & READER_MASK) == 0
+            {
+                // The lock body itself is free (no holder, zero readers), but at
+                // least one other writer shares the waiting slot. Claim ownership
+                // while KEEPING WRITER_WAITING set: as long as any writer is
+                // still queued the flag must stay up, both to keep new readers
+                // out and so the remaining waiters' expected value keeps matching.
+                // Exactly one of the racing CASes succeeds; the losers respin.
+                if self
+                    .state
+                    .compare_exchange(
+                        s,
+                        s | WRITER_HOLDING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return RwLockWriteGuard { lock: self };
+                }
+            }
+
+            if spins > 3_000_000 { eprintln!("STUCK w s={:#010x} readers={} holding={} waiting={}", s, s & READER_MASK, s & WRITER_HOLDING != 0, s & WRITER_WAITING != 0); spins = 0; }
+            let hints = backoff_spins(spins);
+            for _ in 0..hints {
+                core::hint::spin_loop();
+            }
+            spins += 1;
+        }
     }
 }
 
@@ -90,7 +223,10 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: we hold a read-count slot, so no writer can be mutating the
+        // data while this guard is alive; shared access is exactly what readers
+        // are allowed.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -98,7 +234,10 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 // Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Release: reads performed through the guard happen-before the next
+        // writer acquires. Only the low reader-count bits are touched, so the
+        // writer flags stay intact.
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -113,7 +252,8 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: the writer is exclusive, so aliasing rules are trivially met.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -121,7 +261,9 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 // Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // SAFETY: WRITER_HOLDING means zero readers and zero other writers, and
+        // `&mut self` keeps the guard itself unaliased.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -129,7 +271,20 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 // Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Release publishes our mutations to whoever acquires next.
+        //
+        // Only WRITER_HOLDING is cleared. WRITER_WAITING must stay set whenever
+        // some writer is still queued: waiting writers claim ownership with
+        // compare_exchange(WRITER_WAITING, WRITER_HOLDING), so erasing the bit
+        // here would leave their expected value unmatched forever and deadlock
+        // the whole lock (the classic "lost wakeup" bug). Leaving it set also
+        // keeps new readers out until a waiter actually runs, which is precisely
+        // the writer-priority guarantee.
+        //
+        // The last waiter clears the flag itself when its CAS succeeds, so the
+        // bit can never get stuck on; the reader-count field is untouched because
+        // it is provably zero while a writer holds the lock.
+        self.lock.state.fetch_and(!WRITER_HOLDING, Ordering::Release);
     }
 }
 

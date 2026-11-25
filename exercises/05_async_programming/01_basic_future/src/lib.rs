@@ -33,7 +33,17 @@ impl Future for CountDown {
     type Output = &'static str;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        // `CountDown` holds no self-references, so getting `&mut Self` out of the Pin
+        // is sound.
+        let this = self.get_mut();
+        if this.count == 0 {
+            return Poll::Ready("liftoff!");
+        }
+        // Returning Pending must be paired with a wake-up, otherwise the task would
+        // never be polled again and the runtime would park forever.
+        this.count -= 1;
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -57,7 +67,16 @@ impl Future for YieldOnce {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        let this = self.get_mut();
+        if this.yielded {
+            // Second poll: the single yield already happened, so we are done.
+            return Poll::Ready(());
+        }
+        // First poll: remember it, schedule another poll, and report Pending - exactly
+        // what an async state machine does between two await points.
+        this.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

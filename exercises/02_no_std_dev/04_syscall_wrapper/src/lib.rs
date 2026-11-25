@@ -53,23 +53,55 @@ pub struct SyscallABI {
 
 /// Return the x86_64 Linux syscall ABI description
 pub fn x86_64_abi() -> SyscallABI {
-    // TODO: Fill in the x86_64 syscall ABI
-    // Hint: x86_64 uses the "syscall" instruction, syscall number in rax
-    todo!()
+    SyscallABI {
+        arch: "x86_64",
+        instruction: "syscall",
+        id_reg: "rax",
+        ret_reg: "rax",
+        arg_regs: &["rdi", "rsi", "rdx", "r10", "r8", "r9"],
+        // `syscall` stashes the return address in rcx and copies RFLAGS into
+        // r11 (and the kernel clobbers both), so they must be declared clobbered.
+        clobbered: &["rcx", "r11"],
+        sys_write: 1,
+        sys_read: 0,
+        sys_close: 3,
+        sys_exit: 60,
+    }
 }
 
 /// Return the aarch64 Linux syscall ABI description
 pub fn aarch64_abi() -> SyscallABI {
-    // TODO: Fill in the aarch64 syscall ABI
-    // Hint: aarch64 uses the "svc #0" instruction, syscall number in x8
-    todo!()
+    SyscallABI {
+        arch: "aarch64",
+        instruction: "svc #0",
+        id_reg: "x8",
+        ret_reg: "x0",
+        arg_regs: &["x0", "x1", "x2", "x3", "x4", "x5"],
+        // `svc` keeps everything else intact — no implicit clobbers.
+        clobbered: &[],
+        // asm-generic numbers, shared with riscv64.
+        sys_write: 64,
+        sys_read: 63,
+        sys_close: 57,
+        sys_exit: 93,
+    }
 }
 
 /// Return the riscv64 Linux syscall ABI description
 pub fn riscv64_abi() -> SyscallABI {
-    // TODO: Fill in the riscv64 syscall ABI
-    // Hint: riscv64 uses the "ecall" instruction, syscall number in a7
-    todo!()
+    SyscallABI {
+        arch: "riscv64",
+        instruction: "ecall",
+        id_reg: "a7",
+        ret_reg: "a0",
+        arg_regs: &["a0", "a1", "a2", "a3", "a4", "a5"],
+        clobbered: &[],
+        // asm-generic numbers, shared with aarch64.
+        sys_write: 64,
+        sys_read: 63,
+        sys_close: 57,
+        sys_exit: 93,
+    }
 }
 
 // ============================================================
@@ -82,30 +114,61 @@ pub fn riscv64_abi() -> SyscallABI {
 /// The caller must ensure the syscall number and arguments are valid.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub unsafe fn syscall3(id: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
-    // TODO: Implement x86_64 syscall using core::arch::asm!
-    // Hints:
-    //   - "syscall" instruction
-    //   - inlateout("rax") id => ret
-    //   - in("rdi") arg0, in("rsi") arg1, in("rdx") arg2
-    //   - out("rcx") _, out("r11") _
-    todo!()
+    let ret: isize;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") id => ret,
+        in("rdi") arg0,
+        in("rsi") arg1,
+        in("rdx") arg2,
+        // Destroyed by the instruction itself; must be listed so the compiler
+        // does not keep live values in them across the call.
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack)
+    );
+    ret
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub unsafe fn syscall3(id: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
-    // TODO: Implement aarch64 syscall using core::arch::asm!
-    // Hints:
-    //   - "svc #0" instruction
-    //   - in("x8") id
-    //   - inlateout("x0") arg0 => ret
-    //   - in("x1") arg1, in("x2") arg2
-    todo!()
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") id,
+        inlateout("x0") arg0 => ret,
+        in("x1") arg1,
+        in("x2") arg2,
+        options(nostack)
+    );
+    ret
 }
 
 // Non-Linux platforms: provide a stub so the code compiles
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn syscall3(_id: usize, _arg0: usize, _arg1: usize, _arg2: usize) -> isize {
     panic!("syscall3 is only available on Linux")
+}
+
+/// riscv64 reaches the same wrapper through `ecall`; kept for completeness of
+/// the cross-architecture story (and so a riscv64-linux build links).
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+pub unsafe fn syscall3(id: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "ecall",
+        in("a7") id,
+        inlateout("a0") arg0 => ret,
+        in("a1") arg1,
+        in("a2") arg2,
+        options(nostack)
+    );
+    ret
+}
+
+#[cfg(all(not(target_os = "linux"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub unsafe fn syscall3(_id: usize, _arg0: usize, _arg1: usize, _arg2: usize) -> isize {
+    unimplemented!("no raw syscall path for this target")
 }
 
 // Platform-specific write syscall number
@@ -138,27 +201,106 @@ const NATIVE_SYS_CLOSE: usize = 0;
 const NATIVE_SYS_EXIT: usize = 0;
 
 /// Write data from `buf` to file descriptor `fd`.
+///
+/// On Linux the raw syscall is issued; elsewhere the same work is done through
+/// the platform's C library so the wrapper stays usable.
+#[cfg(target_os = "linux")]
 pub fn sys_write(fd: usize, buf: &[u8]) -> isize {
-    // TODO: Call syscall3 to implement write
-    todo!()
+    unsafe { syscall3(NATIVE_SYS_WRITE, fd, buf.as_ptr() as usize, buf.len()) }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sys_write(fd: usize, buf: &[u8]) -> isize {
+    extern "C" {
+        fn write(fd: core::ffi::c_int, buf: *const u8, count: usize) -> isize;
+    }
+    unsafe { write(fd as core::ffi::c_int, buf.as_ptr(), buf.len()) }
 }
 
 /// Read data from file descriptor `fd` into `buf`.
+#[cfg(target_os = "linux")]
 pub fn sys_read(fd: usize, buf: &mut [u8]) -> isize {
-    // TODO: Call syscall3 to implement read
-    todo!()
+    unsafe { syscall3(NATIVE_SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len()) }
 }
 
-/// Close file descriptor `fd`.
+#[cfg(not(target_os = "linux"))]
+pub fn sys_read(fd: usize, buf: &mut [u8]) -> isize {
+    extern "C" {
+        fn read(fd: core::ffi::c_int, buf: *mut u8, count: usize) -> isize;
+    }
+    unsafe { read(fd as core::ffi::c_int, buf.as_mut_ptr(), buf.len()) }
+}
+
+/// Close file descriptor `fd`. Returns 0 on success, a negative errno otherwise.
+#[cfg(target_os = "linux")]
 pub fn sys_close(fd: usize) -> isize {
-    // TODO: Call syscall3 to implement close
-    todo!()
+    unsafe { syscall3(NATIVE_SYS_CLOSE, fd, 0, 0) }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sys_close(fd: usize) -> isize {
+    extern "C" {
+        fn close(fd: core::ffi::c_int) -> core::ffi::c_int;
+        fn __errno_location() -> *mut core::ffi::c_int;
+    }
+    let rc = unsafe { close(fd as core::ffi::c_int) };
+    if rc == 0 {
+        0
+    } else {
+        // Mirror the Linux convention of returning -errno. `close()` reports
+        // failures through errno rather than the return value on this libc.
+        let e = unsafe { *__errno_location() };
+        -(e as isize)
+    }
 }
 
 /// Terminate the current process.
+#[cfg(target_os = "linux")]
 pub fn sys_exit(code: i32) -> ! {
-    // TODO: Call syscall3 to implement exit
-    todo!()
+    unsafe { syscall3(NATIVE_SYS_EXIT, code as usize, 0, 0) };
+    loop {}
+}
+
+#[cfg(all(not(target_os = "linux"), target_env = "musl"))]
+pub fn sys_exit(code: i32) -> ! {
+    // musl (the Rust aarch64-apple-darwin std backend) exposes the Linux
+    // syscall ABI through these symbols, so the real syscall path still works.
+    extern "C" {
+        fn syscall(number: core::ffi::c_long, ...) -> core::ffi::c_long;
+    }
+    unsafe { syscall(NATIVE_SYS_EXIT as core::ffi::c_long, code) };
+    loop {}
+}
+
+/// glibc-style fallback for architectures whose libc does not forward the raw
+/// syscall ABI to us. The number table above stays referenced via `let _`.
+#[cfg(all(
+    not(target_os = "linux"),
+    not(target_env = "musl"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn sys_exit(code: i32) -> ! {
+    extern "C" {
+        fn _exit(status: core::ffi::c_int) -> !;
+    }
+    let _ = (
+        NATIVE_SYS_WRITE,
+        NATIVE_SYS_READ,
+        NATIVE_SYS_CLOSE,
+        NATIVE_SYS_EXIT,
+    );
+    unsafe { _exit(code) }
+}
+
+/// Bare `no_std` targets have no exit path available; this variant only exists
+/// so such a build still links.
+#[cfg(all(
+    not(target_os = "linux"),
+    not(target_env = "musl"),
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+pub fn sys_exit(_code: i32) -> ! {
+    loop {}
 }
 
 // ============================================================

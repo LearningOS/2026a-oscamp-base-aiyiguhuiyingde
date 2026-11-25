@@ -25,20 +25,20 @@ impl AtomicCounter {
     ///
     /// Hint: use `fetch_add` with `Ordering::Relaxed`
     pub fn increment(&self) -> u64 {
-        // TODO
-        todo!()
+        // A counter used on its own has no other data whose visibility must be
+        // published, so Relaxed is enough and lets the CPU/compiler schedule the
+        // surrounding code freely. fetch_add returns the *previous* value.
+        self.value.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Atomically decrements by 1, returns the value **before** decrement.
     pub fn decrement(&self) -> u64 {
-        // TODO
-        todo!()
+        self.value.fetch_sub(1, Ordering::Relaxed)
     }
 
     /// Gets the current value.
     pub fn get(&self) -> u64 {
-        // TODO
-        todo!()
+        self.value.load(Ordering::Relaxed)
     }
 
     /// Atomic CAS (Compare-And-Swap) operation.
@@ -47,8 +47,16 @@ impl AtomicCounter {
     ///
     /// Hint: use `compare_exchange` with success ordering `Ordering::AcqRel` and failure ordering `Ordering::Acquire`
     pub fn compare_and_swap(&self, expected: u64, new_val: u64) -> Result<u64, u64> {
-        // TODO
-        todo!()
+        // AcqRel on success: acts as both an acquire (we consumed the lock-like
+        // value) and a release (our later writes are published). Acquire on
+        // failure: we only learned the current value.
+        match self
+            .value
+            .compare_exchange(expected, new_val, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(old) => Ok(old),
+            Err(actual) => Err(actual),
+        }
     }
 
     /// Multiply the value atomically using a CAS loop.
@@ -56,13 +64,18 @@ impl AtomicCounter {
     ///
     /// Hint: read current value in loop, compute new value, try CAS to update, retry on failure.
     pub fn fetch_multiply(&self, multiplier: u64) -> u64 {
-        // TODO: CAS loop
-        // loop {
-        //     let current = ...
-        //     let new = current * multiplier;
-        //     match self.compare_and_swap(current, new) { ... }
-        // }
-        todo!()
+        // Read-modify-write that is not a single hardware instruction: keep
+        // re-reading until our CAS wins, so a concurrent writer cannot be lost.
+        loop {
+            let current = self.value.load(Ordering::Acquire);
+            let new = current.wrapping_mul(multiplier);
+            match self.compare_and_swap(current, new) {
+                Ok(old) => return old,
+                // `actual` differs from `current`: someone else moved the value,
+                // retry with the fresh snapshot.
+                Err(_actual) => continue,
+            }
+        }
     }
 }
 

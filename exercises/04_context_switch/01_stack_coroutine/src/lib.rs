@@ -15,6 +15,8 @@
 
 #![cfg(target_arch = "riscv64")]
 
+use core::arch::naked_asm;
+
 /// Saved register state for one task (riscv64). Layout must match the offsets used in the asm below: for one task (riscv64). Layout must match the offsets used in the asm below:
 /// `sp` at 0, `ra` at 8, then `s0`–`s11` at 16, 24, … 104.
 #[repr(C)]
@@ -62,9 +64,48 @@ impl TaskContext {
     /// - Set `sp = stack_top` with 16-byte alignment (RISC-V ABI requires 16-byte aligned stack at function entry).
     /// - Leave `s0`–`s11` zero; they will be loaded on switch.
     pub fn init(&mut self, stack_top: usize, entry: usize) {
-        todo!("set ra = entry, sp = stack_top (16-byte aligned)")
+        // `sp` is the value loaded by `switch_context`, i.e. the stack pointer *at* the
+        // moment the entry point starts executing. RISC-V requires it to be 16-byte
+        // aligned at a function entry, so align the top of the buffer down.
+        let sp = (stack_top & !15) as u64;
+        // First switch executes `ret`, which jumps to `ra`: point it at the entry.
+        self.ra = entry as u64;
+        self.sp = sp;
+        // Callee-saved registers start clean; they are just loaded on the first switch.
+        self.s0 = 0;
+        self.s1 = 0;
+        self.s2 = 0;
+        self.s3 = 0;
+        self.s4 = 0;
+        self.s5 = 0;
+        self.s6 = 0;
+        self.s7 = 0;
+        self.s8 = 0;
+        self.s9 = 0;
+        self.s10 = 0;
+        self.s11 = 0;
     }
 }
+
+/// Compile-time proof that the byte offsets hard-coded in the asm below really are
+/// the offsets of the corresponding fields (riscv64: `u64` is 8 bytes, `repr(C)`).
+const _: () = {
+    assert!(core::mem::size_of::<TaskContext>() == 14 * core::mem::size_of::<u64>());
+    assert!(core::mem::offset_of!(TaskContext, sp) == 0);
+    assert!(core::mem::offset_of!(TaskContext, ra) == 8);
+    assert!(core::mem::offset_of!(TaskContext, s0) == 16);
+    assert!(core::mem::offset_of!(TaskContext, s1) == 24);
+    assert!(core::mem::offset_of!(TaskContext, s2) == 32);
+    assert!(core::mem::offset_of!(TaskContext, s3) == 40);
+    assert!(core::mem::offset_of!(TaskContext, s4) == 48);
+    assert!(core::mem::offset_of!(TaskContext, s5) == 56);
+    assert!(core::mem::offset_of!(TaskContext, s6) == 64);
+    assert!(core::mem::offset_of!(TaskContext, s7) == 72);
+    assert!(core::mem::offset_of!(TaskContext, s8) == 80);
+    assert!(core::mem::offset_of!(TaskContext, s9) == 88);
+    assert!(core::mem::offset_of!(TaskContext, s10) == 96);
+    assert!(core::mem::offset_of!(TaskContext, s11) == 104);
+};
 
 /// Switch from `old` to `new` context: save current callee-saved regs into `old`, load from `new`, then `ret` (jumps to `new.ra`).
 ///
@@ -72,15 +113,62 @@ impl TaskContext {
 ///
 /// Must be `#[unsafe(naked)]` to prevent the compiler from generating a prologue/epilogue.
 pub unsafe fn switch_context(old: &mut TaskContext, new: &TaskContext) {
-    todo!("save callee-saved regs to old, load from new, then ret; use #[unsafe(naked)] + naked_asm!, see module doc for riscv64 ABI and layout")
-}
+    // The assembly lives in a `#[unsafe(naked)]` trampoline so the compiler emits no
+    // prologue/epilogue around it; this thin Rust wrapper keeps the public signature.
+    #[unsafe(naked)]
+    unsafe extern "C" fn switch_context_asm(_old: &mut TaskContext, _new: &TaskContext) {
+        naked_asm!(
+        // Save the callee-saved state of the outgoing task into *old (a0).
+        "sd sp,  0(a0)",
+        "sd ra,  8(a0)",
+        "sd s0,  16(a0)",
+        "sd s1,  24(a0)",
+        "sd s2,  32(a0)",
+        "sd s3,  40(a0)",
+        "sd s4,  48(a0)",
+        "sd s5,  56(a0)",
+        "sd s6,  64(a0)",
+        "sd s7,  72(a0)",
+        "sd s8,  80(a0)",
+        "sd s9,  88(a0)",
+        "sd s10, 96(a0)",
+        "sd s11, 104(a0)",
+        // Restore the incoming task's state from *new (a1); symmetric order.
+        "ld sp,  0(a1)",
+        "ld ra,  8(a1)",
+        "ld s0,  16(a1)",
+        "ld s1,  24(a1)",
+        "ld s2,  32(a1)",
+        "ld s3,  40(a1)",
+        "ld s4,  48(a1)",
+        "ld s5,  56(a1)",
+        "ld s6,  64(a1)",
+        "ld s7,  72(a1)",
+        "ld s8,  80(a1)",
+        "ld s9,  88(a1)",
+        "ld s10, 96(a1)",
+        "ld s11, 104(a1)",
+        // Do not leak the context pointers into the newly switched-to task.
+        "li a0, 0",
+        "li a1, 0",
+        // Returns to new.ra: the saved ra for a resumed task, the entry point
+        // for a task started for the very first time.
+        "ret",
+        );
+    }
 
+    unsafe { switch_context_asm(old, new) }
+}
 const STACK_SIZE: usize = 1024 * 64;
 
 /// Allocate a stack for a coroutine. Returns `(buffer, stack_top)` where `stack_top` is the high address
 /// (stack grows down). The buffer must be kept alive for the lifetime of the context using this stack.
 pub fn alloc_stack() -> (Vec<u8>, usize) {
-    todo!("allocate stack buffer, return (buffer, stack_top) with stack_top 16-byte aligned")
+    let buf = vec![0u8; STACK_SIZE];
+    // Stack grows down, so the initial pointer is the *high* end of the buffer.
+    // Align it down to 16 bytes as required by the RISC-V psABI.
+    let stack_top = (buf.as_ptr() as usize + STACK_SIZE) & !15;
+    (buf, stack_top)
 }
 
 #[cfg(test)]

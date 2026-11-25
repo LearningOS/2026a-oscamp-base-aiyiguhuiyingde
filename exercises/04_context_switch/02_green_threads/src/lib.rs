@@ -137,7 +137,29 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        // 1. Own a private stack for this green thread; the Vec must live as long
+        //    as the context (it is stored in `_stack` for exactly that reason).
+        let stack = vec![0u8; STACK_SIZE];
+        // Stack grows down: the initial pointer is the high end of the buffer.
+        let stack_top = stack.as_ptr() as usize + STACK_SIZE;
+
+        // 2. First switch executes `ret`, so `ra = thread_wrapper` makes the new
+        //    thread start inside the wrapper. Keep 16 bytes of headroom below the
+        //    top and align down, as required by the RISC-V psABI.
+        let mut ctx = TaskContext::default();
+        ctx.init(
+            (stack_top - 16) & !15,
+            thread_wrapper as *const () as usize,
+        );
+
+        // 3. Register it as Ready; `entry` is handed to the wrapper through
+        //    CURRENT_THREAD_ENTRY when the scheduler actually switches to it.
+        self.threads.push(GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            _stack: Some(stack),
+            entry: Some(entry),
+        });
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +168,68 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        unsafe {
+            SCHEDULER = self as *mut Scheduler;
+        }
+
+        loop {
+            let all_done = self.threads.iter().skip(1).all(|t| t.state == ThreadState::Finished);
+            if all_done {
+                break;
+            }
+            self.schedule_next();
+        }
+
+        unsafe {
+            SCHEDULER = std::ptr::null_mut();
+        }
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        let total = self.threads.len();
+        let current = self.current;
+
+        // Round-robin: scan current+1, current+2, ... wrapping around, skipping the
+        // caller itself and any thread that already Finished.
+        let mut next = None;
+        for i in 1..total {
+            let idx = (current + i) % total;
+            if self.threads[idx].state == ThreadState::Ready {
+                next = Some(idx);
+                break;
+            }
+        }
+        let Some(next_idx) = next else {
+            // Nothing runnable: stay on the current thread (the scheduler loop in
+            // `run` re-checks for completion and exits instead of spinning here).
+            return;
+        };
+
+        if self.threads[current].state != ThreadState::Finished {
+            self.threads[current].state = ThreadState::Ready;
+        }
+        self.threads[next_idx].state = ThreadState::Running;
+
+        // The freshly scheduled thread reads this once inside `thread_wrapper`.
+        // A thread being resumed after a yield has no entry left, so clear it to
+        // avoid calling the entry a second time.
+        let entry = self.threads[next_idx].entry;
+        unsafe {
+            core::ptr::write(&raw mut CURRENT_THREAD_ENTRY, entry);
+        }
+        self.threads[next_idx].entry = None;
+
+        let old_ptr = self.threads[current].ctx.as_mut_ptr();
+        let new_ptr = self.threads[next_idx].ctx.as_ptr();
+        self.current = next_idx;
+
+        // Saves our callee-saved state into the outgoing thread and never returns
+        // here: control comes back to this same instruction when the scheduler
+        // switches to `current` again later.
+        unsafe {
+            switch_context(&mut *old_ptr, &*new_ptr);
+        }
     }
 }
 
@@ -162,7 +240,37 @@ impl TaskContext {
     fn as_ptr(&self) -> *const TaskContext {
         self as *const TaskContext
     }
+
+    /// Prepare a fresh context whose first switch lands in `entry` running on a
+    /// 16-byte aligned stack ending at `stack_top`. Mirrors
+    /// `01_stack_coroutine::TaskContext::init`: `switch_context` loads `sp`/`ra`
+    /// (and `s0`–`s11`) verbatim and finishes with `ret`, so `ra` is the entry.
+    fn init(&mut self, stack_top: usize, entry: usize) {
+        self.sp = (stack_top & !15) as u64;
+        self.ra = entry as u64;
+        // s0..s11 stay zeroed (TaskContext::default / new).
+    }
 }
+
+/// Compile-time proof that the byte offsets used by the naked asm above match the
+/// `repr(C)` layout of `TaskContext` (same layout as `01_stack_coroutine`).
+const _: () = {
+    assert!(core::mem::size_of::<TaskContext>() == 14 * core::mem::size_of::<u64>());
+    assert!(core::mem::offset_of!(TaskContext, sp) == 0);
+    assert!(core::mem::offset_of!(TaskContext, ra) == 8);
+    assert!(core::mem::offset_of!(TaskContext, s0) == 16);
+    assert!(core::mem::offset_of!(TaskContext, s1) == 24);
+    assert!(core::mem::offset_of!(TaskContext, s2) == 32);
+    assert!(core::mem::offset_of!(TaskContext, s3) == 40);
+    assert!(core::mem::offset_of!(TaskContext, s4) == 48);
+    assert!(core::mem::offset_of!(TaskContext, s5) == 56);
+    assert!(core::mem::offset_of!(TaskContext, s6) == 64);
+    assert!(core::mem::offset_of!(TaskContext, s7) == 72);
+    assert!(core::mem::offset_of!(TaskContext, s8) == 80);
+    assert!(core::mem::offset_of!(TaskContext, s9) == 88);
+    assert!(core::mem::offset_of!(TaskContext, s10) == 96);
+    assert!(core::mem::offset_of!(TaskContext, s11) == 104);
+};
 
 static mut SCHEDULER: *mut Scheduler = std::ptr::null_mut();
 

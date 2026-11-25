@@ -108,30 +108,88 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
 
-        // TODO: Step 1 — traverse free_list, find a suitable block (first-fit)
-        //
-        // Hints:
-        // - Use prev_ptr and curr to traverse the list
-        // - Check if curr address satisfies align, and (*curr).size >= size
-        // - If found, remove it from the list (update prev's next or the free_list head)
-        // - Return curr as *mut u8
+        // ---- Step 1: first-fit search through the free list ----
+        // `prev_ptr` points at the link (either the list head slot or some
+        // block's `next` field) that currently holds `curr`, so unlinking needs
+        // no special case for the head element.
+        let mut prev_ptr: *mut *mut FreeBlock = self.free_list_head_slot();
+        let mut curr = self.free_list_head();
 
-        // TODO: Step 2 — no suitable block in free_list, allocate from bump region
-        //
-        // Same logic as 02_bump_allocator's alloc
-        todo!()
+        while !curr.is_null() {
+            let addr = curr as usize;
+            let aligned = align_up(addr, align);
+            // The usable payload starts at `aligned`; the header we already
+            // wrote lives in the padding before it, so the block must still be
+            // long enough from `aligned` onwards.
+            if aligned + size <= addr + (*curr).size {
+                *prev_ptr = (*curr).next;
+                return aligned as *mut u8;
+            }
+            prev_ptr = &mut (*curr).next as *mut *mut FreeBlock;
+            curr = (*curr).next;
+        }
+
+        // ---- Step 2: nothing suitable in the free list — bump-allocate ----
+        let align_mask = !(align - 1);
+        loop {
+            let next = self
+                .bump_next
+                .load(core::sync::atomic::Ordering::SeqCst);
+            let aligned = (next + align - 1) & align_mask;
+            let end = aligned + size;
+
+            if end > self.heap_end {
+                return null_mut();
+            }
+
+            if self
+                .bump_next
+                .compare_exchange(
+                    next,
+                    end,
+                    core::sync::atomic::Ordering::SeqCst,
+                    core::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return aligned as *mut u8;
+            }
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
 
-        // TODO: Insert the freed block at the head of free_list
-        //
-        // Steps:
-        // 1. Cast ptr to *mut FreeBlock
-        // 2. Write FreeBlock { size, next: current list head }
-        // 3. Update free_list head to ptr
-        todo!()
+        // Push onto the free list. The caller guarantees `ptr` is aligned for
+        // `layout`, whose align we always round up to FreeBlock's align, so the
+        // cast below keeps the header naturally aligned.
+        let block = ptr as *mut FreeBlock;
+        (*block).size = size;
+        (*block).next = self.free_list_head();
+        self.set_free_list_head(block);
+    }
+}
+
+/// Round `addr` up to the next multiple of `align` (`align` must be a power of two).
+fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
+
+impl FreeListAllocator {
+    /// Address of the storage holding the free-list head (a `*mut FreeBlock`
+    /// slot), used as the traversal cursor's starting "link" in `alloc`.
+    #[cfg(test)]
+    fn free_list_head_slot(&self) -> *mut *mut FreeBlock {
+        // The guard is released when this returns; we only hand back the
+        // address of the head field itself, which stays valid for the whole
+        // (single-threaded) traversal.
+        let mut guard = self.free_list.lock().unwrap();
+        core::ptr::from_mut::<*mut FreeBlock>(&mut *guard)
+    }
+
+    #[cfg(not(test))]
+    fn free_list_head_slot(&self) -> *mut *mut FreeBlock {
+        self.free_list.get()
     }
 }
 

@@ -40,23 +40,62 @@ impl<T> SpinLock<T> {
     /// # Safety
     /// Caller must ensure `unlock` is called after using the data.
     pub fn lock(&self) -> &mut T {
-        // TODO
-        todo!()
+        // compare_exchange_weak is the canonical spin-lock primitive: it may
+        // fail spuriously (cheap on LL/SC machines such as ARM/PowerPC) and we
+        // simply retry. Success uses Acquire so that everything the previous
+        // owner did inside its critical section becomes visible to us; failure
+        // only needs Relaxed because we learned nothing yet.
+        //
+        // Bounded backoff on contention. Deliberately no
+        // `std::thread::yield_now()`: a leaked guard (`mem::forget`) would then
+        // spin forever while every other thread blocked, which is unacceptable
+        // for a kernel-style primitive.
+        let mut spins: u32 = 0;
+        loop {
+            match self.locked.compare_exchange_weak(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_previous_false) => {
+                    // SAFETY: `locked == true` and we are the only thread that
+                    // observed it, so no other holder exists; handing out an
+                    // exclusive &mut until unlock() is the lock's contract.
+                    return unsafe { &mut *self.data.get() };
+                }
+                Err(_) => {
+                    let hints = if spins < 8 { 1 } else { spins.min(64) };
+                    for _ in 0..hints {
+                        core::hint::spin_loop();
+                    }
+                    spins += 1;
+                }
+            }
+        }
     }
 
     /// Release lock.
     ///
     /// TODO: Set locked to false (using Release ordering)
     pub fn unlock(&self) {
-        // TODO
-        todo!()
+        // Release: our critical-section writes must be published before the lock
+        // becomes observable as free, pairing with the next holder's Acquire.
+        self.locked.store(false, Ordering::Release);
     }
 
     /// Try to acquire lock without spinning.
     /// Returns Some(&mut T) on success, None if lock is busy.
     pub fn try_lock(&self) -> Option<&mut T> {
-        // TODO: Single compare_exchange attempt
-        todo!()
+        // One attempt only; strong CAS so a spurious failure would wrongly
+        // report "busy" when the lock is actually free.
+        match self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_previous_false) => Some(unsafe { &mut *self.data.get() }),
+            Err(_busy) => None,
+        }
     }
 }
 

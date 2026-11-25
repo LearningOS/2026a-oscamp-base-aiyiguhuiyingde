@@ -39,9 +39,29 @@ impl<T> SpinLock<T> {
     ///
     /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        // Same protocol as the raw spin lock: weak CAS in a loop, Acquire on
+        // success so the previous holder's writes are visible to us. The backoff
+        // is bounded and uses only `spin_loop()` hints (never
+        // `thread::yield_now()`), so this stays safe for kernel-style use where
+        // a guard might be leaked and the owner never gets scheduled again.
+        let mut spins: u32 = 0;
+        loop {
+            match self.locked.compare_exchange_weak(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_previous_false) => return SpinGuard { lock: self },
+                Err(_) => {
+                    let hints = if spins < 8 { 1 } else { spins.min(64) };
+                    for _ in 0..hints {
+                        core::hint::spin_loop();
+                    }
+                    spins += 1;
+                }
+            }
+        }
     }
 }
 
@@ -51,7 +71,9 @@ impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: `&self` can only exist while we hold the lock (it was taken
+        // in SpinLock::lock and is released in Drop), so the data is ours.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -59,7 +81,9 @@ impl<T> Deref for SpinGuard<'_, T> {
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // SAFETY: as above, plus `&mut self` guarantees the guard itself is not
+        // aliased, so the returned &mut is unique for the lock's whole lifetime.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -67,7 +91,10 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Release publishes everything done through the guard before the lock is
+        // handed over. Because Drop runs on scope exit *and* during unwinding,
+        // an escaping panic cannot leave the lock permanently held (no deadlock).
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 
